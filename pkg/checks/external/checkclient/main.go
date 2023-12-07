@@ -106,13 +106,13 @@ func sendReport(s status.Report) error {
 			// Break from the backoff.Retry loop since 400 indicates we're sending a junk
 			// request
 			return backoff.Permanent(fmt.Errorf("fatal status code from kuberhealthy status reporting url: [%d] \"%s\" body: %v", resp.StatusCode, resp.Status, s))
-		case statusCode != http.StatusOK:
+		case statusCode != http.StatusOK && statusCode != http.StatusCreated:
 			writeLog("ERROR: got a bad status code from kuberhealthy: ", statusCode)
 			return fmt.Errorf("ERROR: got a bad status code from kuberhealthy: %d", statusCode)
 		default:
 			// something undexpected has happened, since there is no context for this error
 			// we will not mark it as fatal.
-			writeLog("ERROR: unexepected error when sending report request")
+			writeLog("INFO: No error found in POST ", resp.Status)
 			return reqErr
 		}
 	}, exponentialBackOff)
