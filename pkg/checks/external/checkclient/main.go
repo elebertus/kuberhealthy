@@ -70,64 +70,89 @@ func sendReport(s status.Report) error {
 	writeLog("DEBUG: Sending report with error length of:", len(s.Errors))
 	writeLog("DEBUG: Sending report with ok state of:", s.OK)
 
-	// marshal the request body
-	b, err := json.Marshal(s)
-	if err != nil {
-		writeLog("ERROR: Failed to marshal status JSON:", err)
-		return fmt.Errorf("error mashaling status report json: %w", err)
-	}
+	exponentialBackOff := backoff.NewExponentialBackOff()
+	exponentialBackOff.MaxElapsedTime = maxElapsedTime
 
-	// fetch the server url
+	// fetch the server url outside of the backoff.Retry function body
+	// so it can be used later in logging as well.
 	url, err := getKuberhealthyURL()
 	if err != nil {
 		return fmt.Errorf("failed to fetch the kuberhealthy url: %w", err)
 	}
 	writeLog("INFO: Using kuberhealthy reporting URL: ", url)
 
+	client := &http.Client{}
+
+	// send to the server
+	var statusCode int
+	backoffErr := backoff.Retry(func() error {
+		// If we don't craft a new request on succesive retry the request will not get sent
+		req, err := newKuberhealthyReportRequest(s, url)
+		if err != nil {
+			writeLog("Error generating kuberhealthy request with body ", s)
+			return fmt.Errorf("error generating kuberhealthy request with body %v", s)
+		}
+
+		resp, reqErr := client.Do(req)
+		statusCode = resp.StatusCode
+		// retry on any errors
+		if reqErr != nil {
+			return reqErr
+		}
+		// retry on status codes that do not return a 400
+		switch {
+		case statusCode == http.StatusBadRequest:
+			writeLog("ERROR: got a fatal status code from kuberhealthy: ", statusCode)
+			// Break from the backoff.Retry loop since 400 indicates we're sending a junk
+			// request
+			return backoff.Permanent(fmt.Errorf("fatal status code from kuberhealthy status reporting url: [%d] \"%s\" body: %v", resp.StatusCode, resp.Status, s))
+		case statusCode != http.StatusOK:
+			writeLog("ERROR: got a bad status code from kuberhealthy: ", statusCode)
+			return fmt.Errorf("ERROR: got a bad status code from kuberhealthy: %d", statusCode)
+		default:
+			// something undexpected has happened, since there is no context for this error
+			// we will not mark it as fatal.
+			writeLog("ERROR: unexepected error when sending report request")
+			return reqErr
+		}
+	}, exponentialBackOff)
+	if backoffErr != nil {
+		writeLog("ERROR: got an error sending POST to kuberhealthy: ", backoffErr)
+		return fmt.Errorf("bad POST request to kuberhealthy status reporting url: %w", backoffErr)
+	}
+
+	writeLog("INFO: Got a good http return status code from kuberhealthy URL: ", url, statusCode)
+
+	return backoffErr
+}
+
+// newKuberhealthyReportRequest return a request object with the appropriate headers set
+func newKuberhealthyReportRequest(s status.Report, u string) (*http.Request, error) {
+	var req *http.Request
+
 	// fetch the kh run UUID
 	uuid, err := getKuberhealthyRunUUID()
 	if err != nil {
-		return fmt.Errorf("failed to fetch the kuberhealthy run uuid: %w", err)
+		return req, fmt.Errorf("failed to fetch the kuberhealthy run uuid: %w", err)
 	}
 	writeLog("INFO: Using kuberhealthy run UUID: ", uuid)
 
-	// create the Kuberhealthy post request with the kh-run-uuid header
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(b))
+	// marshal the request body
+	b, err := json.Marshal(s)
 	if err != nil {
-		return fmt.Errorf("error creating http request: %w", err)
+		writeLog("ERROR: Failed to marshal status JSON:", err)
+		return req, fmt.Errorf("error mashaling status report json: %w", err)
+	}
+
+	// create the Kuberhealthy post request with the kh-run-uuid header
+	req, err = http.NewRequest(http.MethodPost, u, bytes.NewBuffer(b))
+	if err != nil {
+		return req, fmt.Errorf("error creating http request: %w", err)
 	}
 	req.Header.Set("kh-run-uuid", uuid)
 	req.Header.Set("Content-Type", "application/json")
 
-	exponentialBackOff := backoff.NewExponentialBackOff()
-	exponentialBackOff.MaxElapsedTime = maxElapsedTime
-
-	client := &http.Client{}
-	// send to the server
-	var resp *http.Response
-	err = backoff.Retry(func() error {
-		var err error
-		writeLog("DEBUG: Making POST request to kuberhealthy:")
-		resp, err = client.Do(req)
-		// retry on any errors
-		if err != nil {
-			return err
-		}
-		// retry on status codes that do not return a 200 or 400
-		if !(resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusBadRequest) {
-			writeLog("ERROR: got a bad status code from kuberhealthy:", resp.StatusCode, resp.Status)
-			return fmt.Errorf("bad status code from kuberhealthy status reporting url: [%d] %s ", resp.StatusCode, resp.Status)
-		}
-		return nil
-	}, exponentialBackOff)
-	if err != nil {
-		writeLog("ERROR: got an error sending POST to kuberhealthy:", err)
-		return fmt.Errorf("bad POST request to kuberhealthy status reporting url: %w", err)
-	}
-
-	writeLog("INFO: Got a good http return status code from kuberhealthy URL:", url)
-
-	return err
+	return req, err
 }
 
 // getKuberhealthyURL fetches the URL that we need to send our external checker
